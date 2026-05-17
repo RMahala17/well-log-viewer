@@ -1,0 +1,1123 @@
+import streamlit as st
+import lasio
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import uuid
+from sklearn.ensemble import RandomForestRegressor
+
+# 1. Page Configuration
+st.set_page_config(page_title="AI Petrophysics", layout="wide")
+# --- GYM OFFLINE EASTER EGG ---
+def inject_offline_screen():
+    import os
+    import base64
+    import io
+    from PIL import Image
+    import streamlit.components.v1 as components
+
+    # Locate your exact folder structure
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_names = ["gym.jpg.jpeg", "gym.jpg", "gym.jpeg", "gym.png"]
+    image_path = None
+    
+    for name in possible_names:
+        full_path = os.path.join(script_dir, name)
+        if os.path.exists(full_path):
+            image_path = full_path
+            break
+
+    img_src = ""
+    if image_path:
+        try:
+            img = Image.open(image_path)
+            
+            # Force convert to RGB to ensure clean JPEG processing
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            
+            # Shrink dimensions down to standard web display size
+            img.thumbnail((350, 350))
+            
+            # Drop quality to 30% to make the code footprint microscopic
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=30)
+            
+            encoded_string = base64.b64encode(buffer.getvalue()).decode('utf-8').strip()
+            img_src = f"data:image/jpeg;base64,{encoded_string}"
+        except Exception as e:
+            img_src = ""
+
+    # Clean JavaScript transmission without f-string conflicts
+    raw_js = """
+    <script>
+        (function() {
+            var imgData = "TARGET_IMAGE_SRC";
+            
+            function checkConnection() {
+                try {
+                    var parentDoc = window.parent.document;
+                    var offlineScreen = parentDoc.getElementById('gym-offline-screen');
+                    
+                    if (!offlineScreen) {
+                        offlineScreen = parentDoc.createElement('div');
+                        offlineScreen.id = 'gym-offline-screen';
+                        
+                        var imgHtml = imgData ? '<img src="' + imgData + '" style="max-width:90%; max-height:50vh; border-radius:15px; margin-bottom:15px; box-shadow: 0 4px 15px rgba(0,0,0,0.8);">' : '<div style="font-size:100px; margin-bottom:20px;">💪</div>';
+                        
+                        offlineScreen.innerHTML = '<div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; background-color:#121212; color:white; font-family:sans-serif; text-align:center; padding:20px;">' + imgHtml + '<h1 style="font-size: 2.2rem; margin-top: 15px; color: #ff4b4b; font-weight: bold; line-height: 1.4;">Bhai internet connect nhi h <br> chl GYM chlte h well logging baad me pd lenge 💪</h1></div>';
+                        
+                        offlineScreen.style.cssText = 'display:none; position:fixed; top:0; left:0; width:100%; height:100%; z-index:9999999; background-color:#121212;';
+                        parentDoc.body.appendChild(offlineScreen);
+                    }
+                    
+                    if (!navigator.onLine) {
+                        offlineScreen.style.display = 'block';
+                    } else {
+                        offlineScreen.style.display = 'none';
+                    }
+                } catch(e) {
+                    console.log("Error handling offline overlay:", e);
+                }
+            }
+
+            window.parent.addEventListener('online', checkConnection);
+            window.parent.addEventListener('offline', checkConnection);
+            checkConnection();
+        })();
+    </script>
+    """
+    
+    # Safely swap out the target placeholder with the real image source text
+    js_code = raw_js.replace("TARGET_IMAGE_SRC", img_src)
+    components.html(js_code, height=0, width=0)
+
+inject_offline_screen()
+# ------------------------------
+st.title(" AI Petrophysics Dashboard")
+
+# --- RESET CALLBACK FUNCTIONS ---
+def reset_curve_settings(prefix, curve, index, defaults_dict):
+    """Forces the UI widgets to revert by explicitly setting their session state values."""
+    for key_suffix, default_val in defaults_dict.items():
+        state_key = f"{prefix}_{key_suffix}_{curve}_{index}"
+        st.session_state[state_key] = default_val
+
+def reset_multi_track(track_id, default_dict):
+    """Forces the Multi-Track widgets to revert."""
+    for key_suffix, default_val in default_dict.items():
+        state_key = f"mt_{key_suffix}_{track_id}"
+        st.session_state[state_key] = default_val
+
+def reset_eval_settings(curve, defaults_dict):
+    """Forces the Formation Evaluation widgets to revert."""
+    for key_suffix, default_val in defaults_dict.items():
+        state_key = f"eval_{key_suffix}_{curve}"
+        st.session_state[state_key] = default_val
+
+# --- ROUTING HELPER FUNCTION ---
+def route_calculated_curve(curve_name, destinations):
+    """Adds newly calculated curves to session state so they appear in other tabs."""
+    if curve_name not in st.session_state.available_curves:
+        st.session_state.available_curves.append(curve_name)
+    
+    if "Recorded Logs" in destinations:
+        if curve_name not in st.session_state.rec_multi:
+            st.session_state.rec_multi.append(curve_name)
+            
+    if "Smoothed Logs" in destinations:
+        if curve_name not in st.session_state.sm_multi:
+            st.session_state.sm_multi.append(curve_name)
+            
+    if "Multi-Track Viewer" in destinations:
+        if st.session_state.multi_tracks:
+            # Route to the first track dynamically
+            first_track_id = st.session_state.multi_tracks[0]['id']
+            mt_key = f"mt_curves_{first_track_id}"
+            if mt_key in st.session_state and curve_name not in st.session_state[mt_key]:
+                st.session_state[mt_key].append(curve_name)
+
+# 2. Sidebar Layout & Data Loading
+st.sidebar.header("📁 Data Loading")
+uploaded_file = st.sidebar.file_uploader("Upload LAS File", type=['las'])
+
+if uploaded_file is not None:
+    st.sidebar.success("File uploaded successfully!")
+    
+    try:
+        # --- ROBUST DATA HANDLING WITH SESSION STATE ---
+        if 'uploaded_filename' not in st.session_state or st.session_state.uploaded_filename != uploaded_file.name:
+            string_data = uploaded_file.getvalue().decode("utf-8")
+            las = lasio.read(string_data)
+            
+            df = las.df()
+            df['DEPTH'] = df.index 
+            cols = ['DEPTH'] + [col for col in df.columns if col != 'DEPTH']
+            df = df[cols].reset_index(drop=True)
+            
+            st.session_state.df = df
+            st.session_state.las = las
+            st.session_state.uploaded_filename = uploaded_file.name
+            
+            # Initialize global curves list
+            st.session_state.available_curves = [col for col in df.columns if col != 'DEPTH']
+            
+            # Default curves logic
+            default_curves = []
+            if 'GR' in st.session_state.available_curves: default_curves.append('GR')
+            if 'AFEC' in st.session_state.available_curves: default_curves.append('AFEC')
+            elif 'RILD' in st.session_state.available_curves: default_curves.append('RILD')
+            
+            # Initialize tab-specific selected curves
+            st.session_state.rec_multi = default_curves.copy()
+            st.session_state.sm_multi = default_curves.copy()
+
+            # Reset multi-tracks
+            st.session_state.multi_tracks = [{'id': str(uuid.uuid4())}, {'id': str(uuid.uuid4())}]
+
+        df = st.session_state.df
+        las = st.session_state.las
+        available_curves = st.session_state.available_curves
+
+        # Extract Header Information
+        def get_header_df(las_section):
+            data = []
+            for item in las_section:
+                data.append({"Mnemonic": item.mnemonic, "Unit": item.unit, "Value": str(item.value), "Description": item.descr})
+            return pd.DataFrame(data)
+
+        well_info = get_header_df(las.well)
+        curve_info = get_header_df(las.curves)
+        param_info = get_header_df(las.params)
+        
+        # Sidebar Controls
+        st.sidebar.header("⚙️ Data Controls")
+        min_depth = float(df['DEPTH'].min())
+        max_depth = float(df['DEPTH'].max())
+        depth_range = st.sidebar.slider("Select Global Depth Range (m):", 
+                                        min_value=min_depth, max_value=max_depth, 
+                                        value=(min_depth, max_depth))
+        
+        df_filtered = df[(df['DEPTH'] >= depth_range[0]) & (df['DEPTH'] <= depth_range[1])].copy()
+        
+        well_name = las.well.WELL.value if las.well.WELL.value else "Unknown Well"
+        st.subheader(f" Well Name: {well_name}")
+
+        # Define Tabs
+        tab_raw, tab_rec, tab_smooth, tab_hist, tab_stats, tab_multi, tab_cross, tab_eval, tab_ml, tab_report = st.tabs([
+            "Raw Data", "Recorded Logs", "Smoothed Logs", "Histogram", "Statistics", "Multi-Track", "Crossplot", "Formation Evaluation", "Machine Learning", "📄 Report"
+        ])
+        
+        # --- TAB 1: RAW DATA & HEADERS ---
+        with tab_raw:
+            st.markdown("###  Raw Log Data")
+            st.dataframe(df_filtered, use_container_width=True)
+            st.markdown("---")
+            st.markdown("###  LAS File Header Information")
+            header_tab1, header_tab2, header_tab3 = st.tabs(["Well Information", "Curve Information", "Parameter Information"])
+            with header_tab1: st.dataframe(well_info, use_container_width=True, hide_index=True)
+            with header_tab2: st.dataframe(curve_info, use_container_width=True, hide_index=True)
+            with header_tab3: st.dataframe(param_info, use_container_width=True, hide_index=True)
+
+        # --- TAB 2: RECORDED LOGS ---
+        with tab_rec:
+            st.markdown("###  Interactive Recorded Logs Viewer")
+            selected_curves = st.multiselect("➕ Add or Remove Log Curves:", available_curves, key="rec_multi")
+            
+            if selected_curves:
+                cols = st.columns(len(selected_curves))
+                for i, curve in enumerate(selected_curves):
+                    with cols[i]:
+                        c_min = float(df_filtered[curve].min()) if not df_filtered[curve].empty else 0.0
+                        c_max = float(df_filtered[curve].max()) if not df_filtered[curve].empty else 100.0
+                        def_col = "#008000" if "GR" in curve.upper() else ("#FF0000" if i%2==0 else "#0000FF")
+                        def_log = True if "R" in curve.upper() or "AFEC" in curve.upper() else False
+                        def_xspc = float(max(0.1, round((c_max-c_min)/5, 1)))
+                        
+                        rec_defaults = {
+                            "col": def_col, "log": def_log, "xmin": c_min, "xmax": c_max,
+                            "depth": (depth_range[0], depth_range[1]), "xspc": def_xspc, "yspc": 50.0
+                        }
+                        
+                        with st.expander(f"⚙️ {curve} Settings"):
+                            rec_c1, rec_c2 = st.columns(2)
+                            curve_color = rec_c1.color_picker(f"🎨 Line Color", def_col, key=f"rec_col_{curve}_{i}")
+                            is_log = rec_c2.checkbox(f"Logarithmic X-Axis", value=def_log, key=f"rec_log_{curve}_{i}")
+                            
+                            b_c1, b_c2 = st.columns(2)
+                            x_min = b_c1.number_input("X Min", value=c_min, key=f"rec_xmin_{curve}_{i}")
+                            x_max = b_c2.number_input("X Max", value=c_max, key=f"rec_xmax_{curve}_{i}")
+                            
+                            track_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=(depth_range[0], depth_range[1]), key=f"rec_depth_{curve}_{i}")
+                            
+                            s_c1, s_c2 = st.columns(2)
+                            x_spacing = s_c1.number_input("X Spacing", value=def_xspc, key=f"rec_xspc_{curve}_{i}")
+                            y_spacing = s_c2.number_input("Y Spacing", value=50.0, key=f"rec_yspc_{curve}_{i}")
+
+                            st.button("🔄 Reset Defaults", key=f"rec_reset_{curve}_{i}", on_click=reset_curve_settings, args=("rec", curve, i, rec_defaults))
+
+                        track_df = df_filtered[(df_filtered['DEPTH'] >= track_depth[0]) & (df_filtered['DEPTH'] <= track_depth[1])]
+                        fig_rec = go.Figure()
+                        fig_rec.add_trace(go.Scatter(x=track_df[curve], y=track_df['DEPTH'], mode='lines', line=dict(color=curve_color, width=1.5), name=curve))
+                        
+                        if is_log:
+                            x_range = [np.log10(x_min) if x_min > 0 else 0, np.log10(x_max) if x_max > 0 else 2]
+                            actual_x_spacing = None 
+                        else:
+                            x_range = [x_min, x_max]
+                            actual_x_spacing = x_spacing
+                            
+                        fig_rec.update_layout(
+                            plot_bgcolor='white', height=800, margin=dict(t=150, b=20, l=50, r=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                            xaxis=dict(title=f"{curve}", side="top", type="log" if is_log else "linear", range=x_range, dtick=actual_x_spacing, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                            yaxis=dict(title="Depth (m)" if i == 0 else "", range=[track_depth[1], track_depth[0]], dtick=y_spacing if y_spacing > 0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black")
+                        )
+                        st.plotly_chart(fig_rec, use_container_width=True)
+
+        # --- TAB 3: SMOOTHED LOGS ---
+        with tab_smooth:
+            st.markdown("### Smoothed Logs Viewer")
+            selected_smooth_curves = st.multiselect("➕ Select Curves to Smooth:", available_curves, key="sm_multi")
+            
+            if selected_smooth_curves:
+                cols_sm = st.columns(len(selected_smooth_curves))
+                for i, curve in enumerate(selected_smooth_curves):
+                    with cols_sm[i]:
+                        c_min = float(df_filtered[curve].min()) if not df_filtered[curve].empty else 0.0
+                        c_max = float(df_filtered[curve].max()) if not df_filtered[curve].empty else 100.0
+                        def_col = "#008000" if "GR" in curve.upper() else "#0000FF"
+                        def_log = True if "R" in curve.upper() or "AFEC" in curve.upper() else False
+                        def_xspc = float(max(0.1, round((c_max-c_min)/5, 1)))
+                        
+                        sm_defaults = {"win": 10, "col": def_col, "log": def_log, "xmin": c_min, "xmax": c_max, "depth": (depth_range[0], depth_range[1]), "xspc": def_xspc, "yspc": 50.0, "orig": True}
+                        
+                        with st.expander(f"⚙️ {curve} Smoothing Settings"):
+                            window_size = st.number_input(f" Window Size", min_value=1, max_value=500, value=10, step=1, key=f"sm_win_{curve}_{i}")
+                            sm_c1, sm_c2 = st.columns(2)
+                            curve_color = sm_c1.color_picker(f"🎨 Line Color", def_col, key=f"sm_col_{curve}_{i}")
+                            is_log = sm_c2.checkbox(f"Logarithmic X-Axis", value=def_log, key=f"sm_log_{curve}_{i}")
+                            
+                            b_c1, b_c2 = st.columns(2)
+                            x_min = b_c1.number_input("X Min", value=c_min, key=f"sm_xmin_{curve}_{i}")
+                            x_max = b_c2.number_input("X Max", value=c_max, key=f"sm_xmax_{curve}_{i}")
+                            
+                            track_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=(depth_range[0], depth_range[1]), key=f"sm_depth_{curve}_{i}")
+                            
+                            s_c1, s_c2 = st.columns(2)
+                            x_spacing = s_c1.number_input("X Spacing", value=def_xspc, key=f"sm_xspc_{curve}_{i}")
+                            y_spacing = s_c2.number_input("Y Spacing", value=50.0, key=f"sm_yspc_{curve}_{i}")
+                            
+                            show_original = st.checkbox(f"Show Original Raw Curve", value=True, key=f"sm_orig_{curve}_{i}")
+                            st.button("🔄 Reset Defaults", key=f"sm_reset_{curve}_{i}", on_click=reset_curve_settings, args=("sm", curve, i, sm_defaults))
+
+                        track_df_sm = df_filtered[(df_filtered['DEPTH'] >= track_depth[0]) & (df_filtered['DEPTH'] <= track_depth[1])].copy()
+                        track_df_sm[f'{curve}_SMOOTH'] = track_df_sm[curve].rolling(window=window_size, center=True, min_periods=1).mean()
+                        
+                        fig_sm = go.Figure()
+                        if show_original:
+                            fig_sm.add_trace(go.Scatter(x=track_df_sm[curve], y=track_df_sm['DEPTH'], mode='lines', line=dict(color='lightgrey', width=1), name=f"{curve} (Raw)", showlegend=False))
+                        fig_sm.add_trace(go.Scatter(x=track_df_sm[f'{curve}_SMOOTH'], y=track_df_sm['DEPTH'], mode='lines', line=dict(color=curve_color, width=2), name=f"{curve} (Smoothed)", showlegend=False))
+                        
+                        if is_log:
+                            x_range = [np.log10(x_min) if x_min > 0 else 0, np.log10(x_max) if x_max > 0 else 2]
+                            actual_x_spacing = None
+                        else:
+                            x_range = [x_min, x_max]
+                            actual_x_spacing = x_spacing
+                            
+                        fig_sm.update_layout(
+                            plot_bgcolor='white', height=800, margin=dict(t=150, b=20, l=50, r=20),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                            xaxis=dict(title=f"{curve} (Smoothed)", side="top", type="log" if is_log else "linear", range=x_range, dtick=actual_x_spacing, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                            yaxis=dict(title="Depth (m)" if i == 0 else "", range=[track_depth[1], track_depth[0]], dtick=y_spacing if y_spacing > 0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black")
+                        )
+                        st.plotly_chart(fig_sm, use_container_width=True)
+
+        # --- TAB 4: HISTOGRAM ---
+        with tab_hist:
+            st.markdown("###  Data Distribution (Histogram)")
+            selected_hist_curves = st.multiselect("➕ Select Curves for Histograms:", available_curves, default=[available_curves[0]] if available_curves else [])
+            if selected_hist_curves:
+                cols_hist = st.columns(len(selected_hist_curves))
+                for i, curve in enumerate(selected_hist_curves):
+                    with cols_hist[i]:
+                        hist_data = df_filtered[curve].dropna()
+                        c_min = float(hist_data.min()) if not hist_data.empty else 0.0
+                        c_max = float(hist_data.max()) if not hist_data.empty else 1.0
+                        def_bin = float(max(0.01, round((c_max - c_min) / 40.0, 2)))
+                        def_col = "#17A2B8" if i % 2 == 0 else "#E83E8C"
+                        def_xspc = float(max(0.1, round((c_max-c_min)/5, 1)))
+                        
+                        hist_defaults = {"bin": def_bin, "col": def_col, "xmin": c_min, "xmax": c_max, "xspc": def_xspc, "yspc": 0}
+                        
+                        with st.expander(f" {curve} Histogram Settings"):
+                            hist_col1, hist_col2 = st.columns([2, 1])
+                            with hist_col1: bin_size = st.number_input(f"Bin Size", min_value=0.01, value=def_bin, step=0.10, format="%.2f", key=f"hist_bin_{curve}_{i}")
+                            with hist_col2: hist_color = st.color_picker(f"Colour", def_col, key=f"hist_col_{curve}_{i}")
+                            
+                            hb_c1, hb_c2 = st.columns(2)
+                            x_min = hb_c1.number_input("X Min", value=c_min, key=f"hist_xmin_{curve}_{i}")
+                            x_max = hb_c2.number_input("X Max", value=c_max, key=f"hist_xmax_{curve}_{i}")
+                            
+                            hs_c1, hs_c2 = st.columns(2)
+                            x_spacing = hs_c1.number_input("X-Axis Spacing", value=def_xspc, key=f"hist_xspc_{curve}_{i}")
+                            y_spacing = hs_c2.number_input("Y-Axis Spacing", value=0, key=f"hist_yspc_{curve}_{i}")
+                        
+                            st.button("🔄 Reset Defaults", key=f"hist_reset_{curve}_{i}", on_click=reset_curve_settings, args=("hist", curve, i, hist_defaults))
+
+                        fig_hist = px.histogram(hist_data, x=curve, color_discrete_sequence=[hist_color], title=f"Distribution of {curve}")
+                        fig_hist.update_traces(xbins=dict(size=bin_size))
+                        fig_hist.update_layout(
+                            plot_bgcolor='white', bargap=0.05,
+                            xaxis=dict(title=curve, range=[x_min, x_max], dtick=x_spacing if x_spacing > 0 else None, showgrid=True, gridcolor="lightgrey", mirror=True, showline=True, linecolor="black"),
+                            yaxis=dict(title="Frequency", dtick=y_spacing if y_spacing > 0 else None, showgrid=True, gridcolor="lightgrey", mirror=True, showline=True, linecolor="black")
+                        )
+                        st.plotly_chart(fig_hist, use_container_width=True)
+
+        # --- TAB 5: STATISTICS ---
+        with tab_stats:
+            st.markdown("###  Overall Dataset Statistics")
+            st.dataframe(df_filtered.describe(), use_container_width=True)
+            st.markdown("---")
+            st.markdown("###  Custom Percentile Calculator")
+            stat_col1, stat_col2 = st.columns(2)
+            with stat_col1:
+                stat_curve = st.selectbox("Select Curve:", available_curves, index=available_curves.index('GR') if 'GR' in available_curves else 0, key="stat_curve")
+            with stat_col2:
+                pct_input = st.text_input("Enter percentiles (comma-separated):", value="5, 10, 50, 90, 95")
+            try:
+                pct_list = [float(p.strip()) for p in pct_input.split(',')]
+                valid_data = df_filtered[stat_curve].dropna()
+                if not valid_data.empty:
+                    calculated_pcts = np.percentile(valid_data, pct_list)
+                    cols = st.columns(len(pct_list))
+                    for i, (pct, val) in enumerate(zip(pct_list, calculated_pcts)):
+                        cols[i].metric(label=f"{pct}th Pct", value=f"{val:.2f}")
+            except ValueError:
+                st.error("Please enter valid numbers.")
+
+            st.markdown("---")
+            st.markdown("### 🔗 Curve Correlation Matrix")
+            corr_curves = st.multiselect("Select curves to compare:", available_curves, default=available_curves[:4] if len(available_curves)>=4 else available_curves, key="corr_multi")
+            if len(corr_curves) > 1:
+                corr_matrix = df_filtered[corr_curves].corr()
+                fig_corr = px.imshow(corr_matrix, text_auto=".2f", aspect="auto", color_continuous_scale="RdBu_r")
+                st.plotly_chart(fig_corr, use_container_width=True)
+
+        # --- TAB 6: MULTI-TRACK ---
+        with tab_multi:
+            st.markdown("###  Dynamic Multi-Track Log Viewer")
+
+            def add_track():
+                st.session_state.multi_tracks.append({'id': str(uuid.uuid4())})
+            def remove_track(track_id):
+                st.session_state.multi_tracks = [t for t in st.session_state.multi_tracks if t['id'] != track_id]
+
+            st.markdown("####  Global Depth Range (Y-Axis)")
+            g_col1, g_col2 = st.columns([3, 1])
+            with g_col1: mt_global_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=(depth_range[0], depth_range[1]), key="mt_global_depth")
+            with g_col2: mt_global_yspc = st.number_input("Global Y Spacing", value=50.0, key="mt_global_yspc")
+
+            st.button("➕ Add New Track", on_click=add_track, type="primary")
+            st.divider()
+
+            default_palette = ['#0000FF', '#FF0000', '#008000', '#FF00FF', '#000000', '#FFA500']
+            track_settings = [] 
+
+            for i, track in enumerate(st.session_state.multi_tracks):
+                track_id = track['id']
+                with st.expander(f"⚙️ Settings: Track {i+1}", expanded=True):
+                    selected_curves = st.multiselect("➕ Add Curves to this Track:", available_curves, key=f"mt_curves_{track_id}")
+                    
+                    mt_defaults = {"log": False, "xmin": 0.0, "xmax": 100.0, "xspc": 10.0}
+                    for j, curve in enumerate(selected_curves): mt_defaults[f"col_{curve}"] = default_palette[j % len(default_palette)]
+
+                    col1, col2 = st.columns(2)
+                    is_log = col1.checkbox("Logarithmic X-axis", key=f"mt_log_{track_id}")
+                    col2.button("❌ Delete Track", on_click=remove_track, args=(track_id,), key=f"del_{track_id}")
+
+                    b_c1, b_c2 = st.columns(2)
+                    x_min = b_c1.number_input("X Min", value=0.0, key=f"mt_xmin_{track_id}")
+                    x_max = b_c2.number_input("X Max", value=100.0, key=f"mt_xmax_{track_id}")
+                    x_spacing = st.number_input("X Major Spacing", value=10.0, key=f"mt_xspc_{track_id}", disabled=is_log)
+
+                    curve_colors = {}
+                    if selected_curves:
+                        st.markdown("**🎨 Curve Colors**")
+                        color_cols = st.columns(len(selected_curves))
+                        for j, curve in enumerate(selected_curves):
+                            with color_cols[j]: curve_colors[curve] = st.color_picker(f"{curve}", value=mt_defaults[f"col_{curve}"], key=f"mt_col_{curve}_{track_id}")
+
+                    st.button("🔄 Reset Track Defaults", key=f"mt_reset_{track_id}", on_click=reset_multi_track, args=(track_id, mt_defaults))
+                    track_settings.append({'curves': selected_curves, 'colors': curve_colors, 'is_log': is_log, 'x_min': x_min, 'x_max': x_max, 'x_spacing': x_spacing})
+
+            st.divider()
+            num_tracks = len(st.session_state.multi_tracks)
+
+            if num_tracks > 0:
+                mt_df = df_filtered[(df_filtered['DEPTH'] >= mt_global_depth[0]) & (df_filtered['DEPTH'] <= mt_global_depth[1])]
+                fig_mt = make_subplots(rows=1, cols=num_tracks, shared_yaxes=True, horizontal_spacing=0.02)
+
+                for i, settings in enumerate(track_settings):
+                    col_idx = i + 1
+                    for curve in settings['curves']:
+                        fig_mt.add_trace(go.Scatter(x=mt_df[curve], y=mt_df['DEPTH'], name=f"T{col_idx}: {curve}", line=dict(color=settings['colors'].get(curve, '#000'), width=1.5), mode='lines'), row=1, col=col_idx)
+
+                    if settings['is_log']:
+                        x_range = [np.log10(settings['x_min']) if settings['x_min'] > 0 else 0, np.log10(settings['x_max']) if settings['x_max'] > 0 else 2]
+                        dtick = None
+                    else:
+                        x_range = [settings['x_min'], settings['x_max']]
+                        dtick = settings['x_spacing'] if settings['x_spacing'] > 0 else None
+
+                    fig_mt.update_xaxes(title_text=", ".join(settings['curves']) if settings['curves'] else f"Track {col_idx}", side="top", type="log" if settings['is_log'] else "linear", range=x_range, dtick=dtick, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=col_idx)
+
+                fig_mt.update_yaxes(title_text="Depth (m)", range=[mt_global_depth[1], mt_global_depth[0]], dtick=mt_global_yspc if mt_global_yspc > 0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=1)
+                fig_mt.update_layout(plot_bgcolor='white', height=800, margin=dict(t=150, b=20, l=50, r=20), showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"))
+                st.plotly_chart(fig_mt, use_container_width=True)
+
+        # --- TAB 7: CROSSPLOT ---
+        with tab_cross:
+            st.write("### Interactive Crossplot")
+            cp_col1, cp_col2, cp_col3 = st.columns(3)
+            with cp_col1: x_axis = st.selectbox("X-Axis:", available_curves, index=0)
+            with cp_col2: y_axis = st.selectbox("Y-Axis:", available_curves, index=1 if len(available_curves)>1 else 0)
+            with cp_col3: color_axis = st.selectbox("Color By:", available_curves, index=2 if len(available_curves)>2 else 0)
+            fig4 = px.scatter(df_filtered, x=x_axis, y=y_axis, color=color_axis, color_continuous_scale="jet")
+            if 'RHOB' in y_axis.upper() or 'DEN' in y_axis.upper(): fig4.update_yaxes(autorange="reversed")
+            if 'RHOB' in x_axis.upper() or 'DEN' in x_axis.upper(): fig4.update_xaxes(autorange="reversed")
+            st.plotly_chart(fig4, use_container_width=True)
+            
+        # --- TAB 8: FORMATION EVALUATION ---
+        with tab_eval:
+            st.markdown("###  Formation Evaluation Calculator")
+            
+            # --- 1. VOLUME OF SHALE (VSH) / IGR ---
+            st.markdown("#### 1. Volume of Shale (Linear Index - Igr)")
+            vsh_c1, vsh_c2, vsh_c3 = st.columns(3)
+            with vsh_c1: gr_curve = st.selectbox("Select GR Curve:", available_curves, index=available_curves.index('GR') if 'GR' in available_curves else 0, key="eval_gr_sel")
+            with vsh_c2: gr_clean = st.number_input("GR Clean (Sand):", value=20.0, step=1.0)
+            with vsh_c3: gr_shale = st.number_input("GR Shale (Shale):", value=100.0, step=1.0)
+
+            vsh_defaults = {"col": "#A52A2A", "log": False, "xmin": 0.0, "xmax": 1.0, "depth": (depth_range[0], depth_range[1]), "xspc": 0.1, "yspc": 50.0}
+            with st.expander("⚙️ Vsh Plot Settings"):
+                set1, set2 = st.columns(2)
+                vsh_color = set1.color_picker("Color", vsh_defaults["col"], key="eval_col_VSH")
+                vsh_log = set2.checkbox("Logarithmic X-Axis", value=vsh_defaults["log"], key="eval_log_VSH")
+                b1, b2 = st.columns(2)
+                vsh_xmin = b1.number_input("X Min", value=vsh_defaults["xmin"], key="eval_xmin_VSH")
+                vsh_xmax = b2.number_input("X Max", value=vsh_defaults["xmax"], key="eval_xmax_VSH")
+                vsh_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=vsh_defaults["depth"], key="eval_depth_VSH")
+                sp1, sp2 = st.columns(2)
+                vsh_xspc = sp1.number_input("X Spacing", value=vsh_defaults["xspc"], key="eval_xspc_VSH")
+                vsh_yspc = sp2.number_input("Y Spacing", value=vsh_defaults["yspc"], key="eval_yspc_VSH")
+                if 'reset_eval_settings' in globals(): st.button("🔄 Reset Vsh Settings", on_click=reset_eval_settings, args=("VSH", vsh_defaults), key="res_VSH")
+            
+            vsh_dest = st.multiselect("🔗 Send 'VSH' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="vsh_dest")
+            if st.button("Calculate Volume of Shale (Linear Index)"):
+                df_filtered['VSH'] = ((df_filtered[gr_curve] - gr_clean) / (gr_shale - gr_clean)).clip(0, 1)
+                st.session_state.df['VSH'] = df_filtered['VSH']
+                route_calculated_curve('VSH', vsh_dest)
+                st.success("✅ Linear VSH (Igr) Calculated!")
+                fig_vsh = go.Figure()
+                fig_vsh.add_trace(go.Scatter(x=df_filtered['VSH'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=vsh_color, width=1.5)))
+                fig_vsh.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                    xaxis=dict(title="Linear VSH (Igr)", side="top", type="log" if vsh_log else "linear", range=[vsh_xmin, vsh_xmax], dtick=None if vsh_log else vsh_xspc, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                    yaxis=dict(title="Depth (m)", range=[vsh_depth[1], vsh_depth[0]], dtick=vsh_yspc if vsh_yspc>0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                st.plotly_chart(fig_vsh, use_container_width=True)
+            
+            st.markdown("---")
+
+            # --- 2. VSH CORRECTION (LARIONOV) ---
+            st.markdown("#### 2. Volume of Shale Correction (Larionov)")
+            vsh_candidates = [col for col in df_filtered.columns if 'VSH' in col.upper() or 'IGR' in col.upper()]
+            if not vsh_candidates:
+                st.warning("⚠️ Please calculate the Linear Volume of Shale (Point 1) first to enable Corrections.")
+            else:
+                vshc_c1, vshc_c2 = st.columns(2)
+                with vshc_c1: vsh_input_curve = st.selectbox("Select Input Vsh (Linear):", vsh_candidates, key="eval_vshc_input")
+                with vshc_c2: correction_types = st.multiselect("Select Rock Age:", ["Tertiary (Younger Rocks)", "Older Rocks"], default=["Tertiary (Younger Rocks)"], key="eval_vshc_type")
+                vshc_defaults = {"col_tert": "#FF8C00", "col_older": "#800080", "log": False, "xmin": 0.0, "xmax": 1.0, "depth": (depth_range[0], depth_range[1]), "xspc": 0.1, "yspc": 50.0}
+                with st.expander("⚙️ Vsh Correction Plot Settings"):
+                    set_c1, set_c2, set_c3 = st.columns(3)
+                    vshc_col_tert = set_c1.color_picker("Color (Tertiary)", vshc_defaults["col_tert"], key="eval_col_VSHC_tert")
+                    vshc_col_older = set_c2.color_picker("Color (Older)", vshc_defaults["col_older"], key="eval_col_VSHC_old")
+                    vshc_log = set_c3.checkbox("Logarithmic X-Axis", value=vshc_defaults["log"], key="eval_log_VSHC")
+                    b_c1, b_c2 = st.columns(2)
+                    vshc_xmin = b_c1.number_input("X Min Bound", value=vshc_defaults["xmin"], key="eval_xmin_VSHC")
+                    vshc_xmax = b_c2.number_input("X Max Bound", value=vshc_defaults["xmax"], key="eval_xmax_VSHC")
+                    vshc_depth = st.slider("Isolate Depth Range", min_value=depth_range[0], max_value=depth_range[1], value=vshc_defaults["depth"], key="eval_depth_VSHC")
+                    sp_c1, sp_c2 = st.columns(2)
+                    vshc_xspc = sp_c1.number_input("X Grid Spacing", value=vshc_defaults["xspc"], key="eval_xspc_VSHC")
+                    vshc_yspc = sp_c2.number_input("Y Grid Spacing", value=vshc_defaults["yspc"], key="eval_yspc_VSHC")
+
+                if st.button("Calculate & Plot Corrected Vsh"):
+                    igr = df_filtered[vsh_input_curve]
+                    fig_vshc = go.Figure()
+                    fig_vshc.add_trace(go.Scatter(x=igr, y=df_filtered['DEPTH'], mode='lines', line=dict(color='lightgrey', width=1.5, dash='dash'), name="Original Linear Vsh"))
+                    if "Tertiary (Younger Rocks)" in correction_types:
+                        df_filtered['VSH_CORR_TERT'] = 0.083 * (np.power(2, (3.7 * igr)) - 1)
+                        df_filtered['VSH_CORR_TERT'] = df_filtered['VSH_CORR_TERT'].clip(0, 1)
+                        st.session_state.df['VSH_CORR_TERT'] = df_filtered['VSH_CORR_TERT']
+                        fig_vshc.add_trace(go.Scatter(x=df_filtered['VSH_CORR_TERT'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=vshc_col_tert, width=2), name="Tertiary Correction"))
+                    if "Older Rocks" in correction_types:
+                        df_filtered['VSH_CORR_OLDER'] = 0.33 * (np.power(2, (2 * igr)) - 1)
+                        df_filtered['VSH_CORR_OLDER'] = df_filtered['VSH_CORR_OLDER'].clip(0, 1)
+                        st.session_state.df['VSH_CORR_OLDER'] = df_filtered['VSH_CORR_OLDER']
+                        fig_vshc.add_trace(go.Scatter(x=df_filtered['VSH_CORR_OLDER'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=vshc_col_older, width=2), name="Older Correction"))
+                    st.success("✅ Corrected Vsh Calculated!")
+                    fig_vshc.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                        xaxis=dict(title="Corrected Vsh", side="top", type="log" if vshc_log else "linear", range=[vshc_xmin, vshc_xmax], dtick=None if vshc_log else vshc_xspc, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                        yaxis=dict(title="Depth (m)", range=[vshc_depth[1], vshc_depth[0]], dtick=vshc_yspc if vshc_yspc>0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                    st.plotly_chart(fig_vshc, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- 3. DENSITY POROSITY (PHID) ---
+            st.markdown("#### 3. Density Porosity (PhiD)")
+            phi_c1, phi_c2, phi_c3 = st.columns(3)
+            rho_idx = next((i for i, c in enumerate(available_curves) if any(x in c.upper() for x in ['RHOB', 'ZDEN', 'DEN'])), 0)
+            with phi_c1: rho_curve = st.selectbox("Select Density Curve:", available_curves, index=rho_idx, key="eval_rho_sel")
+            with phi_c2: rho_mat = st.number_input("Matrix Density:", value=2.65, step=0.01)
+            with phi_c3: rho_fl = st.number_input("Fluid Density:", value=1.00, step=0.01)
+            phi_defaults = {"col": "#1E90FF", "log": False, "xmin": 0.5, "xmax": 0.0, "depth": (depth_range[0], depth_range[1]), "xspc": 0.1, "yspc": 50.0}
+            with st.expander("⚙️ Density Porosity Plot Settings"):
+                set1, set2 = st.columns(2)
+                phi_color = set1.color_picker("Color", phi_defaults["col"], key="eval_col_PHI")
+                b1, b2 = st.columns(2)
+                phi_xmin = b1.number_input("X Min", value=phi_defaults["xmin"], key="eval_xmin_PHI")
+                phi_xmax = b2.number_input("X Max", value=phi_defaults["xmax"], key="eval_xmax_PHI")
+                phi_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=phi_defaults["depth"], key="eval_depth_PHI")
+
+            phi_dest = st.multiselect("🔗 Send 'PHID' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="phi_dest")
+            if st.button("Calculate Density Porosity (PhiD)"):
+                df_filtered['PHID'] = ((rho_mat - df_filtered[rho_curve]) / (rho_mat - rho_fl)).clip(0, 1)
+                st.session_state.df['PHID'] = df_filtered['PHID']
+                route_calculated_curve('PHID', phi_dest)
+                st.success("✅ Density Porosity Calculated!")
+                fig_phi = go.Figure()
+                fig_phi.add_trace(go.Scatter(x=df_filtered['PHID'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=phi_color, width=1.5)))
+                fig_phi.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                    xaxis=dict(title="Density Porosity (PHID)", side="top", range=[phi_xmin, phi_xmax], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                    yaxis=dict(title="Depth (m)", range=[phi_depth[1], phi_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                st.plotly_chart(fig_phi, use_container_width=True)
+                
+            st.markdown("---")
+
+            # --- 4. SONIC POROSITY (PHIS) ---
+            st.markdown("#### 4. Sonic Porosity (Wyllie Time-Average)")
+            phis_c1, phis_c2, phis_c3 = st.columns(3)
+            dt_idx = next((i for i, c in enumerate(available_curves) if any(x in c.upper() for x in ['DT', 'DTCO', 'AC'])), 0)
+            with phis_c1: dt_curve = st.selectbox("Select Transit Time Curve (Δt):", available_curves, index=dt_idx, key="eval_dt_sel")
+            with phis_c2: dt_mat = st.number_input("Matrix Transit Time (Δt_ma):", value=55.5, step=1.0)
+            with phis_c3: dt_fl = st.number_input("Fluid Transit Time (Δt_fl):", value=189.0, step=1.0)
+            phis_defaults = {"col": "#32CD32", "log": False, "xmin": 0.5, "xmax": 0.0, "depth": (depth_range[0], depth_range[1]), "xspc": 0.1, "yspc": 50.0}
+            with st.expander("⚙️ Sonic Porosity Plot Settings"):
+                set1, set2 = st.columns(2)
+                phis_color = set1.color_picker("Color", phis_defaults["col"], key="eval_col_PHIS")
+                phis_xmin = st.number_input("X Min Bound", value=phis_defaults["xmin"], key="eval_xmin_PHIS")
+                phis_xmax = st.number_input("X Max Bound", value=phis_defaults["xmax"], key="eval_xmax_PHIS")
+                phis_depth = st.slider("Isolate Depth Range", min_value=depth_range[0], max_value=depth_range[1], value=phis_defaults["depth"], key="eval_depth_PHIS")
+
+            phis_dest = st.multiselect("🔗 Send 'PHIS' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="phis_dest")
+            if st.button("Calculate Sonic Porosity (PhiS)"):
+                df_filtered['PHIS'] = ((df_filtered[dt_curve] - dt_mat) / (dt_fl - dt_mat)).clip(0, 1)
+                st.session_state.df['PHIS'] = df_filtered['PHIS']
+                route_calculated_curve('PHIS', phis_dest)
+                st.success("✅ Sonic Porosity Calculated!")
+                fig_phis = go.Figure()
+                fig_phis.add_trace(go.Scatter(x=df_filtered['PHIS'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=phis_color, width=1.5)))
+                fig_phis.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                    xaxis=dict(title="Sonic Porosity (PHIS)", side="top", range=[phis_xmin, phis_xmax], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                    yaxis=dict(title="Depth (m)", range=[phis_depth[1], phis_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                st.plotly_chart(fig_phis, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- 5. TOTAL POROSITY (PHIT - NEUTRON DENSITY) ---
+            st.markdown("#### 5. Total Porosity (Neutron-Density Combination)")
+            
+            phit_c1, phit_c2, phit_c3 = st.columns(3)
+            nphi_idx = next((i for i, c in enumerate(available_curves) if any(x in c.upper() for x in ['NPHI', 'HNPHI', 'NPOR'])), 0)
+            with phit_c1: nphi_curve = st.selectbox("Select Neutron Curve (ΦN):", available_curves, index=nphi_idx, key="eval_nphi_sel")
+            phi_curves = [col for col in df_filtered.columns if 'PHID' in col.upper()]
+            with phit_c2: phid_curve = st.selectbox("Select Density Porosity (ΦD):", phi_curves if phi_curves else available_curves, key="eval_phid_input")
+            with phit_c3: geological_case = st.radio("Geological Case:", ["Gas Bearing Formation", "Oil or Brine Bearing"], key="eval_phit_case")
+
+            phit_defaults = {"col": "#FF00FF", "log": False, "xmin": 0.5, "xmax": 0.0, "depth": (depth_range[0], depth_range[1]), "xspc": 0.1, "yspc": 50.0}
+            with st.expander("⚙️ Total Porosity Plot Settings"):
+                set1, set2 = st.columns(2)
+                phit_color = set1.color_picker("Line Color", phit_defaults["col"], key="eval_col_PHIT")
+                phit_xmin = st.number_input("X Min (Total)", value=phit_defaults["xmin"], key="eval_xmin_PHIT")
+                phit_xmax = st.number_input("X Max (Total)", value=phit_defaults["xmax"], key="eval_xmax_PHIT")
+                phit_depth = st.slider("Depth Range", min_value=depth_range[0], max_value=depth_range[1], value=phit_defaults["depth"], key="eval_depth_PHIT")
+
+            phit_dest = st.multiselect("🔗 Send 'PHIT' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="phit_dest")
+
+            if st.button("Calculate Total Porosity (PhiT)"):
+                nphi = df_filtered[nphi_curve]
+                phid = df_filtered[phid_curve]
+                if "Gas" in geological_case:
+                    df_filtered['PHIT'] = np.sqrt((nphi**2 + phid**2) / 2).clip(0, 1)
+                else:
+                    df_filtered['PHIT'] = ((nphi + phid) / 2).clip(0, 1)
+                
+                st.session_state.df['PHIT'] = df_filtered['PHIT']
+                route_calculated_curve('PHIT', phit_dest)
+                st.success(f"✅ Total Porosity ({geological_case}) Calculated!")
+
+                fig_phit = go.Figure()
+                fig_phit.add_trace(go.Scatter(x=df_filtered['PHIT'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=phit_color, width=2)))
+                fig_phit.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                    xaxis=dict(title=f"Total Porosity", side="top", range=[phit_xmin, phit_xmax], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                    yaxis=dict(title="Depth (m)", range=[phit_depth[1], phit_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                st.plotly_chart(fig_phit, use_container_width=True)
+
+            st.markdown("---")
+            
+            # --- 6. EFFECTIVE POROSITY (PHIE) ---
+            st.markdown("#### 6. Effective Porosity (PhiE)")
+            
+            vsh_options = [col for col in df_filtered.columns if 'VSH' in col.upper()]
+            phit_options = [col for col in df_filtered.columns if 'PHI' in col.upper() and col != 'PHIE']
+            
+            if not vsh_options or not phit_options:
+                st.warning("⚠️ Please calculate Volume of Shale and a Porosity curve (preferably Total Porosity) first!")
+            else:
+                phie_c1, phie_c2 = st.columns(2)
+                with phie_c1: vsh_for_phie = st.selectbox("Select Volume of Shale (Vsh):", vsh_options, key="eval_phie_vsh_sel")
+                with phie_c2: phit_for_phie = st.selectbox("Select Total Porosity (PhiT):", phit_options, key="eval_phie_phit_sel")
+
+                phie_defaults = {"col": "#DC143C", "xmin": 0.5, "xmax": 0.0, "depth": (depth_range[0], depth_range[1])}
+                with st.expander("⚙️ Effective Porosity Plot Settings"):
+                    set1 = st.columns(2)
+                    phie_color = set1[0].color_picker("Color", phie_defaults["col"], key="eval_col_PHIE")
+                    phie_xmin = st.number_input("X Min (Effective)", value=phie_defaults["xmin"], key="eval_xmin_PHIE")
+                    phie_xmax = st.number_input("X Max (Effective)", value=phie_defaults["xmax"], key="eval_xmax_PHIE")
+                    phie_depth = st.slider("Depth Range (PHIE)", min_value=depth_range[0], max_value=depth_range[1], value=phie_defaults["depth"], key="eval_depth_PHIE")
+
+                phie_dest = st.multiselect("🔗 Send 'PHIE' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="phie_dest")
+
+                if st.button("Calculate Effective Porosity (PhiE)"):
+                    df_filtered['PHIE'] = (df_filtered[phit_for_phie] * (1 - df_filtered[vsh_for_phie])).clip(0, 1)
+                    st.session_state.df['PHIE'] = df_filtered['PHIE']
+                    route_calculated_curve('PHIE', phie_dest)
+                    st.success("✅ Effective Porosity Calculated!")
+
+                    fig_phie = go.Figure()
+                    fig_phie.add_trace(go.Scatter(x=df_filtered['PHIE'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=phie_color, width=2), fill='tozerox', fillcolor='rgba(220, 20, 60, 0.2)'))
+                    fig_phie.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                        xaxis=dict(title="Effective Porosity (PHIE)", side="top", range=[phie_xmin, phie_xmax], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                        yaxis=dict(title="Depth (m)", range=[phie_depth[1], phie_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                    st.plotly_chart(fig_phie, use_container_width=True)
+                    
+            st.markdown("---")
+
+            # --- 7. ARCHIE'S WATER SATURATION (SW) ---
+            st.markdown("#### 7. Archie's Water Saturation (Sw)")
+            poro_candidates = [col for col in df_filtered.columns if 'PHI' in col.upper()]
+            if not poro_candidates:
+                st.warning("⚠️ Please calculate a Porosity curve first!")
+            else:
+                sw_c0, sw_c1, sw_c2 = st.columns(3)
+                default_poro_idx = poro_candidates.index('PHIE') if 'PHIE' in poro_candidates else 0
+                with sw_c0: poro_input = st.selectbox("Select Porosity source:", poro_candidates, index=default_poro_idx, key="eval_poro_sel_sw")
+                with sw_c1: rt_curve = st.selectbox("Deep Resistivity (Rt):", available_curves, key="eval_rt_sel")
+                with sw_c2: rw_val = st.number_input("Water Res. (Rw):", value=0.05, step=0.01)
+                sw_c3, sw_c4, sw_c5 = st.columns(3)
+                with sw_c3: a_val = st.number_input("a:", value=1.00, step=0.1)
+                with sw_c4: m_val = st.number_input("m:", value=2.00, step=0.1)
+                with sw_c5: n_val = st.number_input("n:", value=2.00, step=0.1)
+                sw_defaults = {"col": "#00CED1", "xmin": 1.0, "xmax": 0.0, "depth": (depth_range[0], depth_range[1])}
+                with st.expander("⚙️ Sw Plot Settings"):
+                    set1 = st.columns(2)
+                    sw_color = set1[0].color_picker("Color", sw_defaults["col"], key="eval_col_SW")
+                    sw_xmin = st.number_input("X Min Sw", value=sw_defaults["xmin"], key="eval_xmin_SW")
+                    sw_xmax = st.number_input("X Max Sw", value=sw_defaults["xmax"], key="eval_xmax_SW")
+                    sw_depth = st.slider("Isolate Depth Sw", min_value=depth_range[0], max_value=depth_range[1], value=sw_defaults["depth"], key="eval_depth_SW")
+
+                sw_dest = st.multiselect("🔗 Send 'SW' to other viewers:", ["Recorded Logs", "Smoothed Logs", "Multi-Track Viewer"], key="sw_dest")
+                if st.button("Calculate Water Saturation (Sw)"):
+                    f_factor = a_val / (df_filtered[poro_input] ** m_val)
+                    df_filtered['SW'] = ((f_factor * rw_val) / df_filtered[rt_curve]) ** (1/n_val)
+                    df_filtered['SW'] = df_filtered['SW'].clip(0, 1)
+                    st.session_state.df['SW'] = df_filtered['SW']
+                    route_calculated_curve('SW', sw_dest)
+                    st.success("✅ Water Saturation Calculated!")
+                    fig_sw = go.Figure()
+                    fig_sw.add_trace(go.Scatter(x=df_filtered['SW'], y=df_filtered['DEPTH'], mode='lines', line=dict(color=sw_color, width=1.5), fill='tozerox', fillcolor='rgba(0, 206, 209, 0.3)'))
+                    fig_sw.update_layout(plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                        xaxis=dict(title="Water Saturation (SW)", side="top", range=[sw_xmin, sw_xmax], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"),
+                        yaxis=dict(title="Depth (m)", range=[sw_depth[1], sw_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black"))
+                    st.plotly_chart(fig_sw, use_container_width=True)
+            
+            st.markdown("---")
+
+            # --- 8. RESERVOIR IDENTIFICATION (FLAG) ---
+            st.markdown("#### 8. Reservoir Identification (Flag)")
+            st.info("Identify reservoir zones based on conditional logic (e.g., Vsh <= 0.4 AND Sw <= 0.7).")
+
+            vsh_options = [col for col in df_filtered.columns if 'VSH' in col.upper()]
+            sw_options = [col for col in df_filtered.columns if 'SW' in col.upper()]
+
+            if not vsh_options or not sw_options:
+                st.warning("⚠️ Please calculate Volume of Shale and Water Saturation (Sw) first to generate a flag!")
+            else:
+                res_c1, res_c2, res_c3 = st.columns(3)
+                with res_c1: res_vsh_curve = st.selectbox("Select Vsh Curve:", vsh_options, key="res_vsh_sel")
+                with res_c2: res_vsh_op_str = st.selectbox("Vsh Operator:", ["<", "<=", "==", ">=", ">"], index=1, key="res_vsh_op")
+                with res_c3: res_vsh_cutoff = st.number_input("Vsh Cutoff:", value=0.40, step=0.05, key="res_vsh_cut")
+
+                res_c4, res_c5, res_c6 = st.columns(3)
+                with res_c4: res_sw_curve = st.selectbox("Select Sw Curve:", sw_options, key="res_sw_sel")
+                with res_c5: res_sw_op_str = st.selectbox("Sw Operator:", ["<", "<=", "==", ">=", ">"], index=1, key="res_sw_op")
+                with res_c6: res_sw_cutoff = st.number_input("Sw Cutoff:", value=0.70, step=0.05, key="res_sw_cut")
+
+                res_defaults = {"col": "#39FF14", "depth": (depth_range[0], depth_range[1])}
+                with st.expander("⚙️ Reservoir Flag Plot Settings"):
+                    set1, set2 = st.columns(2)
+                    res_color = set1.color_picker("Flag Color", res_defaults["col"], key="eval_col_RES")
+                    res_depth = set2.slider("Depth Range (Flag)", min_value=depth_range[0], max_value=depth_range[1], value=res_defaults["depth"], key="eval_depth_RES")
+
+                res_dest = st.multiselect("🔗 Send 'RES_FLAG' to viewers:", ["Multi-Track Viewer"], default=["Multi-Track Viewer"], key="res_dest")
+
+                if st.button("Generate Reservoir Flag"):
+                    # Helper function to map string operators to Python logic
+                    def apply_operator(op_str, val_array, cutoff):
+                        if op_str == "<": return val_array < cutoff
+                        if op_str == "<=": return val_array <= cutoff
+                        if op_str == "==": return val_array == cutoff
+                        if op_str == ">=": return val_array >= cutoff
+                        if op_str == ">": return val_array > cutoff
+                        return val_array <= cutoff
+
+                    cond_vsh = apply_operator(res_vsh_op_str, df_filtered[res_vsh_curve], res_vsh_cutoff)
+                    cond_sw = apply_operator(res_sw_op_str, df_filtered[res_sw_curve], res_sw_cutoff)
+
+                    # Create Flag: 1 if both conditions met, else 0
+                    df_filtered['RES_FLAG'] = np.where(cond_vsh & cond_sw, 1, 0)
+                    st.session_state.df['RES_FLAG'] = df_filtered['RES_FLAG']
+                    route_calculated_curve('RES_FLAG', res_dest)
+                    
+                    st.success(f"✅ Reservoir Flag Generated!")
+
+                    # Plotting Blocky Flag
+                    fig_res = go.Figure()
+                    fig_res.add_trace(go.Scatter(
+                        x=df_filtered['RES_FLAG'], 
+                        y=df_filtered['DEPTH'], 
+                        mode='lines', 
+                        line=dict(color=res_color, width=1.5),
+                        fill='tozerox',
+                        fillcolor=f"rgba({int(res_color[1:3], 16)}, {int(res_color[3:5], 16)}, {int(res_color[5:7], 16)}, 0.6)",
+                        name="Reservoir"
+                    ))
+                    
+                    fig_res.update_layout(
+                        plot_bgcolor='white', height=600, margin=dict(t=150, b=20, l=50, r=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                        xaxis=dict(title="Reservoir Flag", side="top", range=[0, 1.2], showgrid=False, zeroline=False, dtick=1, linecolor="black", mirror=True),
+                        yaxis=dict(title="Depth (m)", range=[res_depth[1], res_depth[0]], showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black")
+                    )
+                    st.plotly_chart(fig_res, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- 9. ROCK PHYSICS & IMPEDANCE PROFILES ---
+            st.markdown("#### 9. Rock Physics & Impedance Profiles")
+            st.info("Calculate Acoustic & Shear Impedance and view depth profiles color-coded by Porosity.")
+            
+            rp_c1, rp_c2, rp_c3 = st.columns(3)
+            with rp_c1: vp_curve = st.selectbox("Select Vp (Compressional) Curve:", available_curves, key="rp_vp_sel")
+            with rp_c2: vs_curve = st.selectbox("Select Vs (Shear) Curve:", available_curves, key="rp_vs_sel")
+            with rp_c3: den_curve = st.selectbox("Select Density Curve:", available_curves, key="rp_den_sel")
+            
+            rp_c4, rp_c5 = st.columns(2)
+            phi_options = [col for col in df_filtered.columns if 'PHI' in col.upper()]
+            with rp_c4: 
+                color_curve = st.selectbox("Color Code By (Porosity):", phi_options if phi_options else available_curves, key="rp_color_sel")
+            with rp_c5:
+                rp_dest = st.multiselect("🔗 Send Impedances to viewers:", ["Multi-Track Viewer", "Recorded Logs", "Smoothed Logs"], default=["Multi-Track Viewer"], key="rp_dest")
+
+            if st.button("Calculate Impedances & Plot Profiles"):
+                df_filtered['ACOUSTIC_IMP'] = df_filtered[vp_curve] * df_filtered[den_curve]
+                df_filtered['SHEAR_IMP'] = df_filtered[vs_curve] * df_filtered[den_curve]
+                
+                st.session_state.df['ACOUSTIC_IMP'] = df_filtered['ACOUSTIC_IMP']
+                st.session_state.df['SHEAR_IMP'] = df_filtered['SHEAR_IMP']
+                
+                route_calculated_curve('ACOUSTIC_IMP', rp_dest)
+                route_calculated_curve('SHEAR_IMP', rp_dest)
+                
+                st.success("✅ Acoustic and Shear Impedances Calculated Successfully!")
+                
+                fig_rp = make_subplots(
+                    rows=1, cols=5, shared_yaxes=True, horizontal_spacing=0.02,
+                    subplot_titles=("Vp Profile", "Vs Profile", "Acoustic Impedance", "Shear Impedance", "Density Profile")
+                )
+                
+                plot_curves = [vp_curve, vs_curve, 'ACOUSTIC_IMP', 'SHEAR_IMP', den_curve]
+                
+                for i, curve in enumerate(plot_curves):
+                    fig_rp.add_trace(go.Scatter(
+                        x=df_filtered[curve], 
+                        y=df_filtered['DEPTH'],
+                        mode='markers',
+                        marker=dict(
+                            color=df_filtered[color_curve],
+                            colorscale='Jet',
+                            showscale=True if i == 4 else False, 
+                            colorbar=dict(title=color_curve, x=1.05) if i == 4 else None,
+                            size=4
+                        ),
+                        name=curve
+                    ), row=1, col=i+1)
+                    
+                    fig_rp.update_xaxes(
+                        title_text=curve, side="top", showgrid=True, gridcolor="lightgrey", 
+                        griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=i+1
+                    )
+                
+                fig_rp.update_yaxes(
+                    title_text="Depth (m)", range=[depth_range[1], depth_range[0]], showgrid=True, 
+                    gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=1
+                )
+                
+                fig_rp.update_layout(
+                    plot_bgcolor='white', height=800, 
+                    margin=dict(t=150, b=20, l=50, r=20),
+                    showlegend=False, 
+                    legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)") 
+                )
+                
+                st.plotly_chart(fig_rp, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- 10. NET PAY CUTOFFS ---
+            st.markdown("#### 10. Net Pay Cutoffs")
+            poro_candidates = [col for col in df_filtered.columns if 'PHI' in col.upper()]
+            vsh_candidates = [col for col in df_filtered.columns if 'VSH' in col.upper()]
+            pay_c0, pay_c1, pay_c2, pay_c3 = st.columns(4)
+            with pay_c0: vsh_src = st.selectbox("Vsh source:", vsh_candidates if vsh_candidates else ["N/A"], key="eval_pay_vsh")
+            default_pay_poro_idx = poro_candidates.index('PHIE') if 'PHIE' in poro_candidates else 0
+            with pay_c1: pay_poro_input = st.selectbox("Porosity source:", poro_candidates if poro_candidates else ["N/A"], index=default_pay_poro_idx if poro_candidates else 0, key="eval_pay_poro")
+            with pay_c2: vsh_cutoff_pay = st.number_input("Max Vsh Cutoff:", value=0.40, step=0.05, key="eval_pay_vsh_cut")
+            with pay_c3: phi_cutoff_pay = st.number_input("Min Phi Cutoff:", value=0.08, step=0.01, key="eval_pay_phi_cut")
+            sw_cutoff_pay = st.number_input("Max Sw Cutoff:", value=0.50, step=0.05, key="eval_pay_sw_cut")
+
+            if st.button("Calculate Net Pay"):
+                if not all(col in df_filtered.columns for col in [vsh_src, 'SW']) or not poro_candidates:
+                    st.error("⚠️ Ensure VSH, PHI, and SW are calculated!")
+                else:
+                    is_pay = (df_filtered[vsh_src] <= vsh_cutoff_pay) & (df_filtered[pay_poro_input] >= phi_cutoff_pay) & (df_filtered['SW'] <= sw_cutoff_pay)
+                    depth_step = abs(df_filtered['DEPTH'].iloc[1] - df_filtered['DEPTH'].iloc[0])
+                    st.success("✅ Net Pay Calculated!")
+                    st.metric(" Total Net Pay Thickness", f"{is_pay.sum() * depth_step:.2f} m")
+
+        # --- TAB 9: MACHINE LEARNING ---
+        with tab_ml:
+            st.write("### AI Log Predictor (Random Forest)")
+            ml_col1, ml_col2 = st.columns(2)
+            with ml_col1: target_curve = st.selectbox("Target Curve:", available_curves, index=0)
+            with ml_col2:
+                default_features = [c for c in available_curves if c != target_curve][:3]
+                feature_curves = st.multiselect("Feature Curves:", available_curves, default=default_features)
+                
+            if st.button("Train AI & Predict"):
+                if len(feature_curves) < 1:
+                    st.warning("Please select at least one Feature Curve.")
+                else:
+                    with st.spinner(" Training Random Forest Model... Please wait!"):
+                        ml_data = df_filtered[feature_curves + [target_curve, 'DEPTH']].dropna()
+                        if len(ml_data) < 50: st.error("Not enough valid data points.")
+                        else:
+                            X, y = ml_data[feature_curves], ml_data[target_curve]
+                            model = RandomForestRegressor(n_estimators=50, random_state=42)
+                            model.fit(X, y)
+                            
+                            pred_name = f'{target_curve}_PREDICTED'
+                            predict_df = df_filtered.dropna(subset=feature_curves).copy()
+                            predict_df[pred_name] = model.predict(predict_df[feature_curves])
+                            st.session_state.df[pred_name] = np.nan
+                            st.session_state.df.loc[predict_df.index, pred_name] = predict_df[pred_name]
+                            
+                            # Add AI curve to global list
+                            if pred_name not in st.session_state.available_curves:
+                                st.session_state.available_curves.append(pred_name)
+                            
+                            st.success(f"Accuracy (R² Score): {model.score(X, y):.2f}. '{pred_name}' added globally.")
+                            
+                            fig_ml = go.Figure()
+                            fig_ml.add_trace(go.Scatter(x=ml_data[target_curve], y=ml_data['DEPTH'], mode='lines', name=f'Original {target_curve}', line=dict(color='black', width=3)))
+                            fig_ml.add_trace(go.Scatter(x=predict_df[pred_name], y=predict_df['DEPTH'], mode='lines', name=f'AI Predicted', line=dict(color='red', width=2, dash='dash')))
+                            fig_ml.update_yaxes(autorange="reversed")
+                            fig_ml.update_layout(
+                                margin=dict(t=150, b=20, l=50, r=20),
+                                legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)")
+                            )
+                            st.plotly_chart(fig_ml, use_container_width=True)
+
+        # --- TAB 10: REPORT GENERATOR ---
+        with tab_report:
+            st.markdown("### 📄 Dynamic PDF Report Generator")
+            st.info("This engine dynamically scans your session for all calculated curves, evaluations, and ML predictions, generating a point-by-point summary without dumping massive raw data tables.")
+            
+            report_filename = st.text_input("Enter Report Name:", value=f"{well_name}_Petrophysics_Report")
+            
+            if st.button("Generate PDF Report", type="primary"):
+                try:
+                    from fpdf import FPDF
+                    import tempfile
+                    
+                    # Helper function to convert Hex colors to RGB for the PDF
+                    def hex_to_rgb(hex_color):
+                        hex_color = hex_color.lstrip('#')
+                        if len(hex_color) != 6: return (0, 0, 0) # Default to black if invalid
+                        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+                    class PDF(FPDF):
+                        def header(self):
+                            self.set_font('Arial', 'B', 15)
+                            self.set_text_color(0, 51, 102) # Dark Blue
+                            self.cell(0, 10, 'AI Petrophysics - Well Analysis Report', 0, 1, 'C')
+                            self.set_font('Arial', 'I', 10)
+                            self.cell(0, 10, f'Well Name: {well_name}', 0, 1, 'C')
+                            self.line(10, 30, 200, 30)
+                            self.ln(10)
+
+                        def footer(self):
+                            self.set_y(-15)
+                            self.set_font('Arial', 'I', 8)
+                            self.set_text_color(128, 128, 128)
+                            self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
+
+                        def chapter_title(self, title):
+                            self.set_font('Arial', 'B', 12)
+                            self.set_fill_color(230, 230, 230)
+                            self.set_text_color(0, 0, 0)
+                            self.cell(0, 10, f' {title}', 0, 1, 'L', 1)
+                            self.ln(2)
+
+                        def chapter_body(self, text, rgb=(0,0,0)):
+                            self.set_font('Arial', '', 10)
+                            self.set_text_color(*rgb)
+                            # SAFEFY FILTER: This forces Python to replace unsupported characters (like emojis/bullet points) 
+                            # with standard characters so the PDF engine never crashes.
+                            clean_text = text.encode('latin-1', 'replace').decode('latin-1')
+                            self.multi_cell(0, 8, clean_text)
+                            self.ln(1)
+
+                    pdf = PDF()
+                    pdf.add_page()
+                    
+                    # --- 1. WELL INFORMATION ---
+                    pdf.chapter_title("1. Well & LAS Information")
+                    well_summary = f"Analyzed Depth Range: {depth_range[0]:.2f} m to {depth_range[1]:.2f} m\n"
+                    well_summary += f"Total Depth Steps: {len(df_filtered)}\n"
+                    well_summary += f"Available Raw Curves: {', '.join([c for c in df.columns if c != 'DEPTH'])}\n"
+                    pdf.chapter_body(well_summary)
+
+                    # --- 2. SMOOTHED LOGS SUMMARY ---
+                    smoothed_cols = [c for c in df_filtered.columns if '_SMOOTH' in c]
+                    if smoothed_cols:
+                        pdf.chapter_title("2. Data Processing (Smoothed Logs)")
+                        for col in smoothed_cols:
+                            base_curve = col.replace('_SMOOTH', '')
+                            # Changed fancy bullet to standard dash
+                            pdf.chapter_body(f"- {base_curve} was smoothed. Mean Value: {df_filtered[col].mean():.2f}", rgb=(0, 0, 255))
+
+                    # --- 3. FORMATION EVALUATION SUMMARY ---
+                    pdf.chapter_title("3. Formation Evaluation & Petrophysics")
+                    
+                    eval_mapping = {
+                        'VSH': ("Linear Volume of Shale", 'eval_col_VSH'),
+                        'VSH_CORR_TERT': ("Tertiary Corrected Vsh", 'eval_col_VSHC_tert'),
+                        'VSH_CORR_OLDER': ("Older Rocks Corrected Vsh", 'eval_col_VSHC_old'),
+                        'PHID': ("Density Porosity", 'eval_col_PHI'),
+                        'PHIS': ("Sonic Porosity", 'eval_col_PHIS'),
+                        'PHIT': ("Total Porosity", 'eval_col_PHIT'),
+                        'PHIE': ("Effective Porosity", 'eval_col_PHIE'),
+                        'SW': ("Water Saturation (Archie)", 'eval_col_SW'),
+                        'ACOUSTIC_IMP': ("Acoustic Impedance", None),
+                        'SHEAR_IMP': ("Shear Impedance", None)
+                    }
+
+                    found_eval = False
+                    for col, (desc, color_key) in eval_mapping.items():
+                        if col in df_filtered.columns:
+                            found_eval = True
+                            mean_val = df_filtered[col].mean()
+                            max_val = df_filtered[col].max()
+                            min_val = df_filtered[col].min()
+                            
+                            ui_hex = st.session_state.get(color_key, '#000000') if color_key else '#000000'
+                            rgb_color = hex_to_rgb(ui_hex)
+                            
+                            # Changed fancy bullets and arrows to standard characters
+                            stat_text = f"- {desc} ({col}):\n   > Mean: {mean_val:.4f}\n   > Range: {min_val:.4f} to {max_val:.4f}"
+                            pdf.chapter_body(stat_text, rgb=rgb_color)
+                            
+                    if not found_eval:
+                        pdf.chapter_body("No formation evaluation calculations were performed in this session.")
+
+                    # --- 4. RESERVOIR & NET PAY FLAGS ---
+                    pdf.chapter_title("4. Reservoir Identification & Net Pay")
+                    if 'RES_FLAG' in df_filtered.columns:
+                        res_count = df_filtered['RES_FLAG'].sum()
+                        depth_step = abs(df_filtered['DEPTH'].iloc[1] - df_filtered['DEPTH'].iloc[0])
+                        ui_hex = st.session_state.get('eval_col_RES', '#000000')
+                        pdf.chapter_body(f"- Reservoir Flag Generated. Total Reservoir Thickness: {res_count * depth_step:.2f} m", rgb=hex_to_rgb(ui_hex))
+                    else:
+                        pdf.chapter_body("Reservoir flags were not generated.")
+
+                    # --- 5. MACHINE LEARNING PREDICTIONS ---
+                    ml_cols = [c for c in df_filtered.columns if '_PREDICTED' in c]
+                    if ml_cols:
+                        pdf.chapter_title("5. Machine Learning Predictions (Random Forest)")
+                        for col in ml_cols:
+                            base_curve = col.replace('_PREDICTED', '')
+                            pdf.chapter_body(f"- AI Model trained to predict {base_curve}.\n   > Predicted Mean: {df_filtered[col].mean():.2f}\n   > Predicted Max: {df_filtered[col].max():.2f}", rgb=(255, 0, 0))
+
+                    # Output PDF to temporary file so Streamlit can download it
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                        pdf.output(tmp_file.name)
+                        
+                        with open(tmp_file.name, "rb") as f:
+                            pdf_bytes = f.read()
+                            
+                    st.success("✅ Report generated successfully! Click below to download.")
+                    st.download_button(
+                        label="Download PDF Report",
+                        data=pdf_bytes,
+                        file_name=f"{report_filename}.pdf",
+                        mime="application/pdf",
+                        type="primary"
+                    )
+                    
+                except ImportError:
+                    st.error("⚠️ The 'fpdf' library is missing. Please run `pip install fpdf` in your terminal to enable PDF generation.")
+                except Exception as e:
+                    st.error(f"⚠️ Error generating report: {e}")
+
+        # --- EXPORT DATA ENGINE ---
+        st.sidebar.markdown("---")
+        st.sidebar.header("💾 Export Data")
+        csv = df_filtered.to_csv(index=False).encode('utf-8')
+        st.sidebar.download_button(label="⬇️ Download Processed Data (CSV)", data=csv, file_name=f"{well_name}_processed.csv", mime='text/csv')
+            
+    except Exception as e:
+        st.error(f"Error reading LAS file: {e}")
+
+else:
+    st.info("👈 Please upload an .las file in the sidebar to get started.")
