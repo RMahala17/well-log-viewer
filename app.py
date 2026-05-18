@@ -10,6 +10,38 @@ from sklearn.ensemble import RandomForestRegressor
 
 # 1. Page Configuration
 st.set_page_config(page_title="AI Petrophysics", layout="wide")
+# --- CUSTOM UI CSS FOR TABS ---
+st.markdown(
+    """
+    <style>
+    /* Make the tab container look like a button row */
+    div[data-baseweb="tab-list"] {
+        gap: 15px;
+        padding-bottom: 10px;
+    }
+    /* Style the individual unselected tabs to look like buttons */
+    button[data-baseweb="tab"] {
+        background-color: rgba(128, 128, 128, 0.1) !important;
+        border-radius: 8px !important;
+        padding: 12px 24px !important;
+        border: 1px solid rgba(128, 128, 128, 0.2) !important;
+        font-weight: 600 !important;
+        transition: all 0.3s ease-in-out;
+    }
+    /* Style the ACTIVE tab with Light Sky Blue */
+    button[data-baseweb="tab"][aria-selected="true"] {
+        background-color: #87CEFA !important; /* Light Sky Blue */
+        color: #121212 !important; /* Dark text for contrast */
+        border: 1px solid #87CEFA !important;
+        box-shadow: 0 4px 10px rgba(135, 206, 250, 0.4) !important;
+    }
+    button[data-baseweb="tab"]:hover {
+        background-color: rgba(135, 206, 250, 0.3) !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 # --- GYM OFFLINE EASTER EGG ---
 def inject_offline_screen():
     import os
@@ -203,7 +235,33 @@ if uploaded_file is not None:
         df_filtered = df[(df['DEPTH'] >= depth_range[0]) & (df['DEPTH'] <= depth_range[1])].copy()
         
         well_name = las.well.WELL.value if las.well.WELL.value else "Unknown Well"
-        st.subheader(f" Well Name: {well_name}")
+        # --- LARGE SKY BLUE TOP BANNER ---
+        st.markdown(
+            f"""
+            <div style="background: linear-gradient(135deg, #87CEFA 0%, #4682B4 100%); 
+                        padding: 35px 25px; 
+                        border-radius: 15px; 
+                        margin-bottom: 25px; 
+                        box-shadow: 0 6px 12px rgba(0,0,0,0.15); 
+                        text-align: left;
+                        display: flex;
+                        justify-content: space-between;
+                        align-items: center;">
+                <div>
+                    <h1 style="color: #ffffff; margin: 0; font-size: 2.5rem; font-weight: 800; text-shadow: 1px 1px 2px rgba(0,0,0,0.25); font-family: sans-serif;">
+                        AI Petrophysics Dashboard
+                    </h1>
+                    <p style="color: #f0f8ff; font-size: 1.1rem; margin-top: 8px; margin-bottom: 0; font-weight: 500; font-family: sans-serif;">
+                        Active Well Reference: <span style="font-size: 1.2rem; font-weight: bold; color: #121212; background-color: rgba(255,255,255,0.75); padding: 3px 12px; border-radius: 6px; margin-left: 6px;">{well_name}</span>
+                    </p>
+                </div>
+                <div style="font-size: 4.5rem; opacity: 0.85; margin-right: 10px;">
+                    🏗️
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         # Define Tabs
         tab_raw, tab_rec, tab_smooth, tab_hist, tab_stats, tab_multi, tab_cross, tab_eval, tab_ml, tab_report = st.tabs([
@@ -1120,4 +1178,88 @@ if uploaded_file is not None:
         st.error(f"Error reading LAS file: {e}")
 
 else:
-    st.info("👈 Please upload an .las file in the sidebar to get started.")
+    # --- MODERN WELCOME LANDING PAGE UI ---
+    import os
+    
+    # Locate rig image path safely using structural file system verification
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_rig_names = ["rig.jpg.jpeg", "rig.jpg", "rig.jpeg", "rig.png"]
+    rig_image_path = None
+    
+    for name in possible_rig_names:
+        full_path = os.path.join(script_dir, name)
+        if os.path.exists(full_path):
+            rig_image_path = full_path
+            break
+
+    # Top Hero Banner Custom CSS layout (Adaptive Gray for Light & Dark Theme)
+    st.markdown(
+        """
+        <div style="background-color: rgba(128, 128, 128, 0.12); padding: 25px; border-radius: 15px; margin-bottom: 30px; border-left: 5px solid #ff4b4b; border-top: 1px solid rgba(128, 128, 128, 0.15); border-right: 1px solid rgba(128, 128, 128, 0.15); border-bottom: 1px solid rgba(128, 128, 128, 0.15);">
+            <h1 style="margin: 0; font-size: 2.6rem; font-weight: bold; letter-spacing: 0.5px;">⚡ AI Petrophysics</h1>
+            <p style="font-size: 1.1rem; margin-top: 6px; margin-bottom: 0; opacity: 0.75; font-family: sans-serif;">
+                Advanced Subsurface Wireline Log Evaluation & Intelligent Interpretation Suite
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # Clean multi-column split section layout
+    col1, col2 = st.columns([1.1, 1])
+    
+    with col1:
+        st.markdown("### Welcome to Your Workspace")
+        st.markdown(
+            """
+            Streamline your geoscientific analysis workflows instantly. 
+            Transform raw log data arrays into production-ready reservoir metrics, 
+            interactive visual profiles, and intelligent machine learning predictions.
+            """
+        )
+        
+        # Sleek, premium adaptive 4-card grid layout (Works perfectly on all backgrounds)
+        st.markdown(
+            """
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-top: 20px; margin-bottom: 25px;">
+                <div style="background-color: rgba(128, 128, 128, 0.1); padding: 15px; border-radius: 10px; border: 1px solid rgba(128, 128, 128, 0.2); display: flex; align-items: center;">
+                    <span style="font-size: 1.3rem; margin-right: 10px;">📊</span>
+                    <span style="font-weight: bold; font-size: 1rem;">Multi-Track Logs</span>
+                </div>
+                <div style="background-color: rgba(128, 128, 128, 0.1); padding: 15px; border-radius: 10px; border: 1px solid rgba(128, 128, 128, 0.2); display: flex; align-items: center;">
+                    <span style="font-size: 1.3rem; margin-right: 10px;">📈</span>
+                    <span style="font-weight: bold; font-size: 1rem;">Crossplot Maps</span>
+                </div>
+                <div style="background-color: rgba(128, 128, 128, 0.1); padding: 15px; border-radius: 10px; border: 1px solid rgba(128, 128, 128, 0.2); display: flex; align-items: center;">
+                    <span style="font-size: 1.3rem; margin-right: 10px;">🧮</span>
+                    <span style="font-weight: bold; font-size: 1rem;">Petrophysical Math</span>
+                </div>
+                <div style="background-color: rgba(128, 128, 128, 0.1); padding: 15px; border-radius: 10px; border: 1px solid rgba(128, 128, 128, 0.2); display: flex; align-items: center;">
+                    <span style="font-size: 1.3rem; margin-right: 10px;">🤖</span>
+                    <span style="font-weight: bold; font-size: 1rem;">Machine Learning</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        # High contrast interactive notice box pointing straight to the sidebar
+        st.info("👈 **GET STARTED:** Please drop or upload an `.las` data file in the sidebar to activate processing controls.")
+
+    with col2:
+        if rig_image_path:
+            st.image(rig_image_path, use_container_width=True, caption="Offshore Drillsite Platform Exploration")
+        else:
+            # Clean fallback visual placeholder if image asset hasn't been saved yet
+            st.markdown(
+                """
+                <div style="background-color: rgba(128, 128, 128, 0.08); height: 320px; border-radius: 15px; display: flex; flex-direction: column; align-items: center; justify-content: center; border: 2px dashed rgba(128, 128, 128, 0.25); text-align: center; padding: 20px;">
+                    <span style="font-size: 50px; margin-bottom: 10px;">🏗️</span>
+                    <h4 style="margin: 5px 0; opacity: 0.8;">Asset Placeholder: rig.jpg</h4>
+                    <p style="opacity: 0.6; max-width: 280px; font-size: 0.85rem; line-height: 1.4;">
+                        Place your rig photo file inside the 'petapp' folder directory to automatically load platform graphics here!
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
