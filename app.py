@@ -270,15 +270,164 @@ if uploaded_file is not None:
         
         # --- TAB 1: RAW DATA & HEADERS ---
         with tab_raw:
+            
+            # -------------------------------------------------------------
+            # 🌐 MASTER STORAGE SYNCHRONIZATION (Prevents data loss on rerun)
+            # -------------------------------------------------------------
+            if 'master_log_df' not in st.session_state:
+                st.session_state.master_log_df = df_filtered.copy()
+            else:
+                # Ensure any external filter changes to depth keep our custom columns intact
+                for col in st.session_state.master_log_df.columns:
+                    if col not in df_filtered.columns:
+                        df_filtered[col] = st.session_state.master_log_df[col]
+
+            if 'added_curves_registry' not in st.session_state:
+                st.session_state.added_curves_registry = []
+
+            # -------------------------------------------------------------
+            # ⚙️ ENGINEERING & COLUMN CUSTOMIZATION TOOLBAR
+            # -------------------------------------------------------------
+            st.markdown("### ⚙️ Engineering & Column Customization Toolbar")
+            t_col1, t_col2 = st.columns(2)
+
+            with t_col1:
+                # --- ADD ENGINE ---
+                with st.expander("🛠️ Add New Log Curves (Unlimited)", expanded=False):
+                    cc_col1, cc_col2 = st.columns([2, 1])
+                    with cc_col1:
+                        new_col_name = st.text_input("New Curve Name", placeholder="e.g., CALI2, CALI3, BS2", key="ui_new_curve_name")
+                    with cc_col2:
+                        st.markdown("<div style='padding-top:28px;'></div>", unsafe_allow_html=True)
+                        add_col_btn = st.button("🚀 Add Column", type="primary", use_container_width=True)
+
+                    if add_col_btn:
+                        cleaned_name = new_col_name.strip()
+                        if not cleaned_name:
+                            st.error("❌ Column name cannot be empty!")
+                        elif cleaned_name in st.session_state.master_log_df.columns:
+                            st.warning(f"⚠️ Column '{cleaned_name}' already exists!")
+                        else:
+                            import numpy as np
+                            # Inject permanently into master session state dataframe
+                            st.session_state.master_log_df[cleaned_name] = np.nan
+                            df_filtered[cleaned_name] = np.nan
+                            st.session_state.added_curves_registry.append(cleaned_name)
+                            st.success(f"✅ Column '{cleaned_name}' added permanently!")
+                            st.rerun()
+
+                # --- DELETE ENGINE ---
+                with st.expander("❌ Delete Existing Log Curves", expanded=False):
+                    deletable_cols = [c for c in df_filtered.columns if c != 'DEPTH']
+                    
+                    if deletable_cols:
+                        dc_col1, dc_col2 = st.columns([2, 1])
+                        with dc_col1:
+                            col_to_delete = st.selectbox("Select Column to Delete", deletable_cols, key="ui_delete_curve_select")
+                        with dc_col2:
+                            st.markdown("<div style='padding-top:28px;'></div>", unsafe_allow_html=True)
+                            delete_col_btn = st.button("🗑️ Delete Column", type="primary", use_container_width=True)
+
+                        if delete_col_btn:
+                            # 1. Drop from active dataframe view
+                            if col_to_delete in df_filtered.columns:
+                                df_filtered.drop(columns=[col_to_delete], inplace=True)
+                            
+                            # 2. Drop from master storage session state to ensure permanence
+                            if col_to_delete in st.session_state.master_log_df.columns:
+                                st.session_state.master_log_df.drop(columns=[col_to_delete], inplace=True)
+                            
+                            # 3. Clear from tracking registry if it was custom made
+                            if col_to_delete in st.session_state.added_curves_registry:
+                                st.session_state.added_curves_registry.remove(col_to_delete)
+                                
+                            st.success(f"💥 Column '{col_to_delete}' has been completely deleted!")
+                            st.rerun()
+                    else:
+                        st.info("No logs available for deletion.")
+
+            with t_col2:
+                # --- EXCEL FILL DOWN ENGINE ---
+                with st.expander("⚡ Excel-Style Fill Down Tool", expanded=False):
+                    active_cols = [c for c in df_filtered.columns if c != 'DEPTH']
+                    fd_col = st.selectbox("Select Target Column", active_cols, key="fd_active_col_select")
+                    fd_mode = st.radio("Value Source", ["Enter Custom Constant", "Copy 1st Row Value Down"], horizontal=True)
+                    
+                    fd_val = 0.0
+                    if fd_mode == "Enter Custom Constant":
+                        st.markdown("<div style='margin-top:-15px;'></div>", unsafe_allow_html=True)
+                        fd_val = st.number_input("Constant Numeric Value", value=0.0, format="%.4f")
+                    
+                    run_fill_down = st.button("⚡ Execute Fill Down", type="secondary", use_container_width=True)
+
+                    if run_fill_down:
+                        if fd_mode == "Copy 1st Row Value Down" and not df_filtered.empty:
+                            import pandas as pd
+                            first_val = df_filtered[fd_col].iloc[0]
+                            fd_val = float(first_val) if (not pd.isna(first_val) and first_val is not None) else 0.0
+                        
+                        st.session_state.master_log_df[fd_col] = fd_val
+                        df_filtered[fd_col] = fd_val
+                        st.success(f"⚡ Column '{fd_col}' filled completely with {fd_val}!")
+                        st.rerun()
+
+            # Finalize sync mapping to clean up views
+            for col in list(df_filtered.columns):
+                if col != 'DEPTH' and col not in st.session_state.master_log_df.columns:
+                    df_filtered.drop(columns=[col], inplace=True)
+            for col in st.session_state.master_log_df.columns:
+                if col not in df_filtered.columns:
+                    df_filtered[col] = st.session_state.master_log_df[col]
+            
+            # Global Synchronization for dropdown menu parameters across other tabs
+            available_curves = [col for col in df_filtered.columns if col not in ['DEPTH']]
+
+            st.divider()
+
+            # -------------------------------------------------------------
+            # 📋 INTERACTIVE EXCEL SPREADSHEET (Copy-Paste & Editing Active)
+            # -------------------------------------------------------------
             st.markdown("###  Raw Log Data")
-            st.dataframe(df_filtered, use_container_width=True)
+            st.caption("💡 *Pro-Tip: Select any cell, paste arrays from Excel using Ctrl+V, or edit individual rows manually.*")
+            
+            # Upgraded active data spreadsheet editor
+            edited_df = st.data_editor(
+                df_filtered, 
+                use_container_width=True, 
+                num_rows="fixed",
+                key="master_raw_data_editor"
+            )
+
+            # Cell editing feedback loop tracking to save modifications permanently
+            editor_state = st.session_state.get("master_raw_data_editor")
+            if editor_state and "edited_rows" in editor_state:
+                edited_rows = editor_state["edited_rows"]
+                if edited_rows:
+                    import numpy as np
+                    for row_idx_str, changes in edited_rows.items():
+                        row_idx = int(row_idx_str)
+                        actual_depth = df_filtered.iloc[row_idx]['DEPTH']
+                        
+                        master_mask = st.session_state.master_log_df['DEPTH'] == actual_depth
+                        if master_mask.any():
+                            for col_name, new_value in changes.items():
+                                val_to_write = float(new_value) if new_value is not None else np.nan
+                                st.session_state.master_log_df.loc[master_mask, col_name] = val_to_write
+                    st.rerun()
+
+            # Dataset Summary Footer
+            st.markdown(f"**Total Active Rows:** {df_filtered.shape[0]}")
+            
+            # -------------------------------------------------------------
+            # 🏢 RESTORED SECTION: NEAT LAS FILE HEADER INFORMATION TABBED VIEW
+            # -------------------------------------------------------------
             st.markdown("---")
             st.markdown("###  LAS File Header Information")
             header_tab1, header_tab2, header_tab3 = st.tabs(["Well Information", "Curve Information", "Parameter Information"])
             with header_tab1: st.dataframe(well_info, use_container_width=True, hide_index=True)
             with header_tab2: st.dataframe(curve_info, use_container_width=True, hide_index=True)
             with header_tab3: st.dataframe(param_info, use_container_width=True, hide_index=True)
-
+            
         # --- TAB 2: RECORDED LOGS ---
         with tab_rec:
             st.markdown("###  Interactive Recorded Logs Viewer")
@@ -467,14 +616,14 @@ if uploaded_file is not None:
 
         # --- TAB 6: MULTI-TRACK ---
         with tab_multi:
-            st.markdown("###  Dynamic Multi-Track Log Viewer")
+            st.markdown("### 🏢 Dynamic Multi-Track Log Viewer with Fluid & Lithology Intelligence")
 
             def add_track():
                 st.session_state.multi_tracks.append({'id': str(uuid.uuid4())})
             def remove_track(track_id):
                 st.session_state.multi_tracks = [t for t in st.session_state.multi_tracks if t['id'] != track_id]
 
-            st.markdown("####  Global Depth Range (Y-Axis)")
+            st.markdown("#### 📐 Global Depth Range (Y-Axis)")
             g_col1, g_col2 = st.columns([3, 1])
             with g_col1: mt_global_depth = st.slider("Isolate Depth", min_value=depth_range[0], max_value=depth_range[1], value=(depth_range[0], depth_range[1]), key="mt_global_depth")
             with g_col2: mt_global_yspc = st.number_input("Global Y Spacing", value=50.0, key="mt_global_yspc")
@@ -484,11 +633,22 @@ if uploaded_file is not None:
 
             default_palette = ['#0000FF', '#FF0000', '#008000', '#FF00FF', '#000000', '#FFA500']
             track_settings = [] 
+            
+            # --- BACKEND MATRIX LOGIC FROM THE TABLE ---
+            # 1. Calculate DPHI silently if missing but RHOB is present
+            if 'RHOB' in df_filtered.columns and 'DPHI' not in df_filtered.columns:
+                df_filtered['DPHI'] = (2.65 - df_filtered['RHOB']) / (2.65 - 1.0)
+            
+            # 2. Identify the Resistivity curve dynamically from the file
+            rt_col = next((c for c in df_filtered.columns if c.upper() in ['RT', 'ILD', 'LLD', 'RESD', 'RES', 'LL3']), None)
+            
+            mt_available_curves = [col for col in df_filtered.columns if col not in ['DEPTH']]
 
             for i, track in enumerate(st.session_state.multi_tracks):
                 track_id = track['id']
                 with st.expander(f"⚙️ Settings: Track {i+1}", expanded=True):
-                    selected_curves = st.multiselect("➕ Add Curves to this Track:", available_curves, key=f"mt_curves_{track_id}")
+                    st.caption("💡 *Backend active: The system will automatically auto-shade Gas (Red), Oil (Green), Brine (Blue), and Shale (Gray) based on the matrix table definitions.*")
+                    selected_curves = st.multiselect("➕ Add Curves to this Track:", mt_available_curves, key=f"mt_curves_{track_id}")
                     
                     mt_defaults = {"log": False, "xmin": 0.0, "xmax": 100.0, "xspc": 10.0}
                     for j, curve in enumerate(selected_curves): mt_defaults[f"col_{curve}"] = default_palette[j % len(default_palette)]
@@ -498,9 +658,20 @@ if uploaded_file is not None:
                     col2.button("❌ Delete Track", on_click=remove_track, args=(track_id,), key=f"del_{track_id}")
 
                     b_c1, b_c2 = st.columns(2)
-                    x_min = b_c1.number_input("X Min", value=0.0, key=f"mt_xmin_{track_id}")
-                    x_max = b_c2.number_input("X Max", value=100.0, key=f"mt_xmax_{track_id}")
-                    x_spacing = st.number_input("X Major Spacing", value=10.0, key=f"mt_xspc_{track_id}", disabled=is_log)
+                    
+                    # Smart default scales for standard curves
+                    if any(c in ['DPHI', 'NPHI'] for c in selected_curves):
+                        default_xmin, default_xmax, default_spc = 0.45, -0.15, 0.15
+                    elif 'GR' in selected_curves:
+                        default_xmin, default_xmax, default_spc = 0.0, 150.0, 30.0
+                    elif rt_col and rt_col in selected_curves:
+                        default_xmin, default_xmax, default_spc = 0.2, 2000.0, 10.0
+                    else:
+                        default_xmin, default_xmax, default_spc = 0.0, 100.0, 10.0
+                    
+                    x_min = b_c1.number_input("X Min", value=default_xmin, key=f"mt_xmin_{track_id}")
+                    x_max = b_c2.number_input("X Max", value=default_xmax, key=f"mt_xmax_{track_id}")
+                    x_spacing = st.number_input("X Major Spacing", value=default_spc, key=f"mt_xspc_{track_id}", disabled=is_log)
 
                     curve_colors = {}
                     if selected_curves:
@@ -516,14 +687,59 @@ if uploaded_file is not None:
             num_tracks = len(st.session_state.multi_tracks)
 
             if num_tracks > 0:
-                mt_df = df_filtered[(df_filtered['DEPTH'] >= mt_global_depth[0]) & (df_filtered['DEPTH'] <= mt_global_depth[1])]
+                mt_df = df_filtered[(df_filtered['DEPTH'] >= mt_global_depth[0]) & (df_filtered['DEPTH'] <= mt_global_depth[1])].copy()
                 fig_mt = make_subplots(rows=1, cols=num_tracks, shared_yaxes=True, horizontal_spacing=0.02)
+
+                # --- ADVANCED FLUID MATRIX LOGIC CALCULATION ---
+                gr_cutoff = 75.0
+                rt_cutoff = 10.0
+                
+                # Pre-fill base flags arrays
+                is_sand = mt_df['GR'] < gr_cutoff if 'GR' in mt_df.columns else np.ones(len(mt_df), dtype=bool)
+                is_shale = mt_df['GR'] >= gr_cutoff if 'GR' in mt_df.columns else np.zeros(len(mt_df), dtype=bool)
+                
+                res_vals = mt_df[rt_col] if rt_col else np.ones(len(mt_df)) * 100.0
+                has_high_rt = res_vals > rt_cutoff
+                
+                has_crossover = (mt_df['NPHI'] < mt_df['DPHI']) if ('NPHI' in mt_df.columns and 'DPHI' in mt_df.columns) else np.zeros(len(mt_df), dtype=bool)
+
+                # Define explicit condition masks
+                gas_mask = is_sand & has_high_rt & has_crossover
+                oil_mask = is_sand & has_high_rt & (~has_crossover)
+                brine_mask = is_sand & (~has_high_rt)
 
                 for i, settings in enumerate(track_settings):
                     col_idx = i + 1
-                    for curve in settings['curves']:
-                        fig_mt.add_trace(go.Scatter(x=mt_df[curve], y=mt_df['DEPTH'], name=f"T{col_idx}: {curve}", line=dict(color=settings['colors'].get(curve, '#000'), width=1.5), mode='lines'), row=1, col=col_idx)
+                    x_left, x_right = settings['x_min'], settings['x_max']
 
+                    # --- FLUID AND LITHOLOGY BACKGROUND SHADING ---
+                    # 1. Shale Shading (Gray)
+                    shale_x = np.where(is_shale, x_right, x_left)
+                    fig_mt.add_trace(go.Scatter(x=[x_left]*len(mt_df), y=mt_df['DEPTH'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=col_idx)
+                    fig_mt.add_trace(go.Scatter(x=shale_x, y=mt_df['DEPTH'], mode='lines', fill='tonextx', fillcolor='rgba(128, 128, 128, 0.25)', line=dict(width=0), name='Shale Zone', showlegend=(col_idx==1)), row=1, col=col_idx)
+
+                    # 2. Brine/Water Sand Shading (Light Blue)
+                    brine_x = np.where(brine_mask, x_right, x_left)
+                    fig_mt.add_trace(go.Scatter(x=[x_left]*len(mt_df), y=mt_df['DEPTH'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=col_idx)
+                    fig_mt.add_trace(go.Scatter(x=brine_x, y=mt_df['DEPTH'], mode='lines', fill='tonextx', fillcolor='rgba(135, 206, 250, 0.45)', line=dict(width=0), name='Brine Sand', showlegend=(col_idx==1)), row=1, col=col_idx)
+
+                    # 3. Oil Sand Shading (Green)
+                    oil_x = np.where(oil_mask, x_right, x_left)
+                    fig_mt.add_trace(go.Scatter(x=[x_left]*len(mt_df), y=mt_df['DEPTH'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=col_idx)
+                    fig_mt.add_trace(go.Scatter(x=oil_x, y=mt_df['DEPTH'], mode='lines', fill='tonextx', fillcolor='rgba(46, 139, 87, 0.4)', line=dict(width=0), name='Oil Sand', showlegend=(col_idx==1)), row=1, col=col_idx)
+
+                    # 4. Gas Sand Shading (Red/Orange Crossover Area)
+                    gas_x = np.where(gas_mask, x_right, x_left)
+                    fig_mt.add_trace(go.Scatter(x=[x_left]*len(mt_df), y=mt_df['DEPTH'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=col_idx)
+                    fig_mt.add_trace(go.Scatter(x=gas_x, y=mt_df['DEPTH'], mode='lines', fill='tonextx', fillcolor='rgba(255, 69, 0, 0.5)', line=dict(width=0), name='Gas Sand', showlegend=(col_idx==1)), row=1, col=col_idx)
+
+
+                    # --- STANDARD CURVE PLOTTING OVER THE BACKGROUNDS ---
+                    for curve in settings['curves']:
+                        dash_style = 'dash' if curve == 'NPHI' else 'solid'
+                        fig_mt.add_trace(go.Scatter(x=mt_df[curve], y=mt_df['DEPTH'], name=f"{curve}", line=dict(color=settings['colors'].get(curve, '#000'), width=1.8, dash=dash_style), mode='lines'), row=1, col=col_idx)
+
+                    # Configure Axis Scales
                     if settings['is_log']:
                         x_range = [np.log10(settings['x_min']) if settings['x_min'] > 0 else 0, np.log10(settings['x_max']) if settings['x_max'] > 0 else 2]
                         dtick = None
@@ -533,8 +749,9 @@ if uploaded_file is not None:
 
                     fig_mt.update_xaxes(title_text=", ".join(settings['curves']) if settings['curves'] else f"Track {col_idx}", side="top", type="log" if settings['is_log'] else "linear", range=x_range, dtick=dtick, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=col_idx)
 
+                # Final Layout adjustments
                 fig_mt.update_yaxes(title_text="Depth (m)", range=[mt_global_depth[1], mt_global_depth[0]], dtick=mt_global_yspc if mt_global_yspc > 0 else None, showgrid=True, gridcolor="lightgrey", griddash="dash", mirror=True, showline=True, linecolor="black", row=1, col=1)
-                fig_mt.update_layout(plot_bgcolor='white', height=800, margin=dict(t=150, b=20, l=50, r=20), showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"))
+                fig_mt.update_layout(plot_bgcolor='white', height=850, margin=dict(t=150, b=20, l=50, r=20), showlegend=True, legend=dict(orientation="h", yanchor="bottom", y=1.12, xanchor="center", x=0.5, bgcolor="rgba(255,255,255,0.8)"))
                 st.plotly_chart(fig_mt, use_container_width=True)
 
         # --- TAB 7: CROSSPLOT ---
