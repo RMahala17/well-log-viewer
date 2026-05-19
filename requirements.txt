@@ -3,3 +3,4 @@ lasio
 pandas
 numpy
 plotly
+scikit-learn
