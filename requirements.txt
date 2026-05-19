@@ -2,3 +2,4 @@ streamlit
 lasio
 pandas
 numpy
+plotly
